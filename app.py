@@ -26,45 +26,6 @@ WORKSPACE_CLIENT = WorkspaceClient(
 )
 
 # -----------------------
-# Fixed Table Binding
-# -----------------------
-CATALOG = "db-analytics-dev"
-SCHEMA = "development"  # Change this to your schema if needed
-TABLE = "employees"
-
-FULL_TABLE_NAME = f"{CATALOG}.{SCHEMA}.{TABLE}"
-
-# -----------------------
-# Schema Cache
-# -----------------------
-@st.cache_data(show_spinner=False)
-def load_table_schema(full_table_name: str):
-    try:
-        table_info = WORKSPACE_CLIENT.tables.get(full_name=full_table_name)
-        if hasattr(table_info, "as_dict"):
-            table_info = table_info.as_dict()
-            columns = table_info.get("columns") or []
-        else:
-            columns = getattr(table_info, "columns", None) or []
-
-        parsed = []
-        for col in columns:
-            if isinstance(col, dict):
-                name = col.get("name") or col.get("col_name")
-                col_type = col.get("type_name") or col.get("type_text") or col.get("type")
-            else:
-                name = getattr(col, "name", None)
-                col_type = getattr(col, "type_name", None) or getattr(col, "type_text", None) or getattr(col, "type", None)
-
-            if name:
-                parsed.append(f"{name} {col_type}".strip())
-
-        return parsed
-    except Exception as e:
-        logging.warning(f"Failed to load schema for {full_table_name}: {e}")
-        return []
-
-# -----------------------
 # Display & Performance Settings
 # -----------------------
 DISPLAY_TABLE = False
@@ -385,7 +346,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-logging.info("🚀 Genie Streamlit app started (FORCED SQL + FIXED TABLE MODE)")
+logging.info("🚀 Genie Streamlit app started (FORCED SQL MODE)")
 
 # -----------------------
 # Session State
@@ -402,43 +363,7 @@ if "question_cache" not in st.session_state:
 # -----------------------
 
 def start_conversation(question: str):
-    # 🔒 HARD GROUNDED PROMPT
-    schema_lines = load_table_schema(FULL_TABLE_NAME)
-    schema_block = ""
-    if schema_lines:
-        schema_block = "Table columns (name type):\n" + "\n".join(schema_lines) + "\n"
-    want_chart = is_chart_request(question)
-
     forced_prompt = f"""
-You are a Databricks SQL analytics agent.
-
-RULES:
-1. You MUST generate SQL
-2. You MUST execute SQL
-3. You MUST return QUERY_RESULT
-4. You are ONLY allowed to query this table:
-   {FULL_TABLE_NAME}
-
-5. Do NOT use any other tables
-6. Do NOT hallucinate schemas
-7. Do NOT return text-only answers
-8. Always attach QUERY_RESULT
-9. If the user asks for summary/overview/profile/describe, return a SQL summary query with aggregates (row count, null counts per column, and basic stats for numeric columns).
-10. Unless the user explicitly requests the full dataset or export, apply a LIMIT 200 to keep response fast.
-11. If the user asks for a chart/graph/plot, also include a TEXT attachment with a JSON object describing the visualization:
-    {{
-      "chart_type": "pie|bar|line",
-      "category_col": "string column name",
-      "value_col": "numeric column name or null",
-      "aggregation": "count|sum|mean",
-      "title": "short chart title"
-    }}
-    Only use columns from the table schema. If value_col is null, aggregation must be "count".
-
-Table schema source:
-Unity Catalog
-{schema_block}
-
 User question:
 {question}
 """
@@ -486,8 +411,8 @@ def get_query_result_with_retry(conversation_id, message_id, attachment_id, max_
     return last_result
 
 @st.cache_data(show_spinner=False)
-def start_conversation_cached(question: str, full_table_name: str, space_id: str):
-    # Cache by question + table + space to avoid repeated Genie calls
+def start_conversation_cached(question: str, space_id: str):
+    # Cache by question + space to avoid repeated Genie calls
     return start_conversation(question)
 
 @st.cache_data(show_spinner=False)
@@ -501,18 +426,13 @@ def get_query_result_cached(conversation_id, message_id, attachment_id):
 st.set_page_config(page_title="Genie AI Analytics", layout="wide")
 
 st.title("🧠 Databricks Genie AI")
-st.caption("🔒 Fixed Table Mode • SQL Only • Table Output Only")
-
-st.markdown(f"""
-**Bound Table:**  
-`{FULL_TABLE_NAME}`
-""")
+st.caption("🔒 SQL Only • Table Output Only")
 
 # Chat container
 chat_container = st.container()
 
 # Input at bottom (chat style)
-question = st.chat_input("Ask about expenses_master (table answers only)...")
+question = st.chat_input("Ask a question (table answers only)...")
 
 if question:
     with st.spinner("Genie generating SQL and executing query..."):
@@ -523,7 +443,7 @@ if question:
                 msg = cached_msg
                 cache_hit = True
             else:
-                msg = start_conversation_cached(question, FULL_TABLE_NAME, GENIE_SPACE_ID)
+                msg = start_conversation_cached(question, GENIE_SPACE_ID)
                 st.session_state.question_cache[normalized_question] = msg
                 cache_hit = False
 
@@ -680,7 +600,7 @@ with chat_container:
                             st.download_button(
                                 "⬇ Download CSV",
                                 csv,
-                                file_name="expenses_master_result.csv",
+                                file_name="query_result.csv",
                                 mime="text/csv",
                                 key=f"download_{item['conversation_id']}_{item['message_id']}_{attachment_id}",
                             )
@@ -693,6 +613,6 @@ with chat_container:
                     st.error("Failed to load query result")
 
         if not table_rendered:
-            st.warning("⚠ No SQL result returned")
+            pass
 
         st.markdown("---")
