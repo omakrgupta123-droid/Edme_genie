@@ -1,15 +1,18 @@
 import streamlit as st
 import os
 import logging
-import json
 import datetime
 import time
+import re
 from dotenv import load_dotenv
 import pandas as pd
-import plotly.express as px
 from databricks.sdk import WorkspaceClient
-import boto3
-from langchain_aws import ChatBedrock
+
+# LangGraph imports for memory management
+from langgraph.checkpoint.memory import MemorySaver
+# from langgraph.checkpoint.sqlite import SqliteSaver
+from typing import Optional, Dict, Any, List
+import uuid
 
 # -----------------------
 # Load env
@@ -30,32 +33,16 @@ WORKSPACE_CLIENT = WorkspaceClient(
 # -----------------------
 DISPLAY_TABLE = False
 ENABLE_CSV_DOWNLOAD = False
-SHOW_SUMMARY_HEADER = False
 
 # -----------------------
-# Bedrock / LangChain Config
+# Memory Saver Configuration
 # -----------------------
-ENABLE_BEDROCK_CHARTS = True
-BEDROCK_PROFILE = "qms-assumed-role"
-BEDROCK_REGION = "ap-south-1"
-BEDROCK_MODEL_ID = "global.anthropic.claude-opus-4-5-20251101-v1:0"
+# Choose memory type: "sqlite" for persistent storage, "memory" for in-memory only
+MEMORY_TYPE = os.getenv("MEMORY_TYPE", "sqlite")  # Options: "sqlite" or "memory"
+SQLITE_DB_PATH = os.getenv("SQLITE_DB_PATH", "genie_conversations.db")
 
-# Keywords for summary-style requests
-SUMMARY_KEYWORDS = ("summary", "overview", "profile", "describe", "stats", "statistics")
-CHART_KEYWORDS = ("chart", "graph", "plot", "visual", "visualize", "trend", "distribution", "compare", "correlation", "insight", "display")
+# Keywords for table requests
 TABLE_KEYWORDS = ("table", "tabular", "dataframe", "rows", "columns", "show data", "show table")
-
-def is_summary_request(text: str) -> bool:
-    if not text:
-        return False
-    lowered = text.lower()
-    return any(k in lowered for k in SUMMARY_KEYWORDS)
-
-def is_chart_request(text: str) -> bool:
-    if not text:
-        return False
-    lowered = text.lower()
-    return any(k in lowered for k in CHART_KEYWORDS)
 
 def is_table_request(text: str) -> bool:
     if not text:
@@ -63,277 +50,276 @@ def is_table_request(text: str) -> bool:
     lowered = text.lower()
     return any(k in lowered for k in TABLE_KEYWORDS)
 
-def _format_value(value):
-    if pd.isna(value):
-        return "NULL"
-    if isinstance(value, (int, float)):
-        if isinstance(value, bool):
-            return str(value)
-        try:
-            return f"{value:,.4g}" if isinstance(value, float) else f"{value:,}"
-        except Exception:
-            return str(value)
-    return str(value)
 
-def _json_safe(value):
-    if pd.isna(value):
+ORDINAL_WORD_TO_NUMBER = {
+    "first": 1,
+    "second": 2,
+    "third": 3,
+    "fourth": 4,
+    "fifth": 5,
+    "sixth": 6,
+    "seventh": 7,
+    "eighth": 8,
+    "ninth": 9,
+    "tenth": 10,
+}
+
+
+def _ordinal_label(n: int) -> str:
+    if 10 <= (n % 100) <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def _extract_requested_question_number(text: str) -> Optional[int]:
+    lowered = text.lower()
+
+    digit_match = re.search(r"\b(\d+)(st|nd|rd|th)?\b", lowered)
+    if digit_match:
+        try:
+            return int(digit_match.group(1))
+        except Exception:
+            pass
+
+    for word, number in ORDINAL_WORD_TO_NUMBER.items():
+        if re.search(rf"\b{word}\b", lowered):
+            return number
+
+    return None
+
+
+def maybe_answer_from_history(question: str, history: List[Dict[str, Any]]) -> Optional[str]:
+    if not question:
         return None
-    if hasattr(value, "item"):
-        try:
-            return value.item()
-        except Exception:
-            pass
-    if isinstance(value, (datetime.date, datetime.datetime)):
-        try:
-            return value.isoformat()
-        except Exception:
-            pass
-    return value
 
-def summarize_dataframe(df: pd.DataFrame) -> str:
-    if df is None or df.empty:
-        return "No rows returned."
-    if len(df) == 1:
-        row = df.iloc[0].to_dict()
-        parts = [f"{k} = {_format_value(v)}" for k, v in row.items()]
-        return "Summary: " + ", ".join(parts) + "."
-    cols = ", ".join(list(df.columns)[:8])
-    if len(df.columns) > 8:
-        cols += ", ..."
-    return f"Summary: results returned for columns {cols}."
+    lowered = question.lower()
+    if "question" not in lowered:
+        return None
 
-def summarize_result(schema, rows) -> str:
-    if not rows:
-        return "No rows returned."
-    if len(rows) == 1 and schema:
-        row = rows[0]
-        parts = []
-        for idx, col in enumerate(schema):
-            if isinstance(col, dict):
-                name = col.get("name") or f"col_{idx}"
-            else:
-                name = str(col)
-            value = row[idx] if idx < len(row) else None
-            parts.append(f"{name} = {_format_value(value)}")
-        return "Summary: " + ", ".join(parts) + "."
-    col_names = []
-    if schema:
-        for col in schema[:8]:
-            if isinstance(col, dict):
-                col_names.append(col.get("name") or "")
-            else:
-                col_names.append(str(col))
-    cols = ", ".join([c for c in col_names if c])
-    if schema and len(schema) > 8:
-        cols += ", ..."
-    if cols:
-        return f"Summary: results returned for columns {cols}."
-    return "Summary: results returned successfully."
+    asks_previous = bool(re.search(r"\b(previous|last)\b", lowered))
+    requested_number = _extract_requested_question_number(lowered)
+    asks_numbered_question = requested_number is not None and "question" in lowered
+    generic_history_question = bool(re.search(r"\bwhat was my question\b", lowered))
+
+    if not (asks_previous or asks_numbered_question or generic_history_question):
+        return None
+
+    questions = [item.get("question", "") for item in history if item.get("question")]
+    if not questions:
+        return "I do not have any earlier questions in this session yet."
+
+    if asks_previous or generic_history_question:
+        previous_question = questions[-1]
+        return f'Your previous question was: "{previous_question}"'
+
+    # Numbered question request
+    target_index = requested_number - 1
+    if target_index < 0 or target_index >= len(questions):
+        return f"You have asked {len(questions)} question(s) in this session, so I cannot fetch question {_ordinal_label(requested_number)}."
+
+    return f'Your {_ordinal_label(requested_number)} question was: "{questions[target_index]}"'
+
+def _extract_sql_text(result: dict) -> str | None:
+    if not isinstance(result, dict):
+        return None
+
+    statement = result.get("statement_response") or result.get("statement") or {}
+    if isinstance(statement, dict):
+        for key in ("statement", "sql", "query", "command"):
+            val = statement.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+
+        nested = statement.get("statement")
+        if isinstance(nested, dict):
+            for key in ("statement", "sql", "query", "command"):
+                val = nested.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+
+    for key in ("statement", "sql", "query", "command"):
+        val = result.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+
+    return None
+
+# -----------------------
+# LangGraph Memory Saver Functions
+# -----------------------
 
 @st.cache_resource(show_spinner=False)
-def get_bedrock_llm():
-    if not ENABLE_BEDROCK_CHARTS:
-        return None
+def get_memory_saver():
+    """
+    Initialize and return the appropriate memory saver based on configuration.
+    
+    Returns:
+        MemorySaver or SqliteSaver instance
+    """
     try:
-        session = boto3.Session(profile_name=BEDROCK_PROFILE, region_name=BEDROCK_REGION)
-        client = session.client("bedrock-runtime", region_name=BEDROCK_REGION)
-        return ChatBedrock(model_id=BEDROCK_MODEL_ID, client=client)
+        if MEMORY_TYPE == "sqlite":
+            # Use SqliteSaver for persistent storage
+            logging.info(f"Initializing SqliteSaver with database: {SQLITE_DB_PATH}")
+            # return SqliteSaver.from_conn_string(SQLITE_DB_PATH)
+        else:
+            # Use MemorySaver for in-memory storage (lost on restart)
+            logging.info("Initializing MemorySaver (in-memory)")
+            return MemorySaver()
     except Exception as e:
-        logging.warning(f"Bedrock client init failed: {e}")
-        return None
+        logging.error(f"Failed to initialize memory saver: {e}")
+        # Fallback to MemorySaver
+        return MemorySaver()
 
-def _extract_json(text: str):
-    if not text:
-        return None
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
+
+def save_conversation_turn(
+    checkpointer,
+    thread_id: str,
+    user_message: str,
+    ai_response: str,
+    metadata: Optional[Dict[str, Any]] = None
+):
+    """
+    Save a conversation turn (user question + AI response) to LangGraph memory.
+    
+    Args:
+        checkpointer: The memory saver instance
+        thread_id: Unique thread identifier for this conversation
+        user_message: User's question
+        ai_response: AI's response
+        metadata: Optional metadata (conversation_id, message_id, etc.)
+    """
     try:
-        return json.loads(text[start:end + 1])
-    except Exception:
-        return None
-
-def _validate_genie_viz_spec(spec: dict):
-    if not isinstance(spec, dict):
-        return None
-    chart_type = (spec.get("chart_type") or "").lower()
-    if chart_type not in ("pie", "bar", "line"):
-        return None
-    category_col = spec.get("category_col")
-    aggregation = (spec.get("aggregation") or "count").lower()
-    if aggregation not in ("count", "sum", "mean"):
-        aggregation = "count"
-    title = spec.get("title") or "Chart"
-    value_col = spec.get("value_col")
-    return {
-        "chart_type": chart_type,
-        "category_col": category_col,
-        "value_col": value_col,
-        "aggregation": aggregation,
-        "title": title,
-    }
-
-def extract_genie_viz_spec(attachments, answer_text: str):
-    candidates = []
-    for att in attachments or []:
-        text = (att.get("text") or {}).get("content")
-        if text:
-            candidates.append(text)
-    if answer_text:
-        candidates.append(answer_text)
-    for text in candidates:
-        spec = _extract_json(text)
-        spec = _validate_genie_viz_spec(spec)
-        if spec:
-            return spec
-    return None
-
-@st.cache_data(show_spinner=False)
-def infer_chart_spec(context, question: str, answer_text: str, genie_spec: dict | None):
-    llm = get_bedrock_llm()
-    if not llm:
-        return None
-    genie_block = json.dumps(genie_spec) if genie_spec else "null"
-    prompt = f"""
-You are a data visualization assistant. Choose the best chart to visualize the data.
-Return JSON only (no extra text) with keys:
-chart_type: one of ["pie","bar","line"]
-category_col: a categorical column name (string)
-value_col: a numeric column name or null
-aggregation: one of ["count","sum","mean"]
-title: short chart title
-
-Guidelines:
-- Use pie for category distributions (counts).
-- Use bar for category + numeric values.
-- Use line for time trends or ordered numeric series.
-- If value_col is null, use count.
-- Choose only columns that exist.
-
-User question: {question}
-Genie answer: {answer_text}
-Genie structured spec (use this as primary guidance): {genie_block}
-Context: {json.dumps(context)}
-"""
-    try:
-        resp = llm.invoke(prompt)
-        text = resp.content if hasattr(resp, "content") else str(resp)
-        return _extract_json(text)
-    except Exception as e:
-        logging.warning(f"Bedrock chart spec failed: {e}")
-        return None
-
-def _limit_categories(chart_df: pd.DataFrame, cat_col: str, value_col: str, top_n: int = 10):
-    if chart_df is None or chart_df.empty:
-        return chart_df
-    if len(chart_df) <= top_n:
-        return chart_df
-    sorted_df = chart_df.sort_values(value_col, ascending=False)
-    top_df = sorted_df.head(top_n).copy()
-    other_sum = sorted_df[value_col].iloc[top_n:].sum()
-    other_row = pd.DataFrame({cat_col: ["Other"], value_col: [other_sum]})
-    return pd.concat([top_df, other_row], ignore_index=True)
-
-def build_chart_context(df: pd.DataFrame):
-    sample_rows = []
-    if df is not None and not df.empty:
-        for _, row in df.head(50).iterrows():
-            sample_rows.append({k: _json_safe(v) for k, v in row.to_dict().items()})
-    dtypes = {c: str(df[c].dtype) for c in df.columns} if df is not None else {}
-    uniques = {}
-    if df is not None and not df.empty:
-        for c in df.columns:
-            try:
-                uniques[c] = int(df[c].nunique(dropna=False))
-            except Exception:
-                uniques[c] = None
-    return {
-        "columns": list(df.columns) if df is not None else [],
-        "dtypes": dtypes,
-        "unique_counts": uniques,
-        "sample": sample_rows,
-    }
-
-def build_chart_payload(df: pd.DataFrame, question: str, answer_text: str, genie_spec: dict | None):
-    if df is None or df.empty:
-        return None
-    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
-    non_numeric_cols = [c for c in df.columns if c not in numeric_cols]
-
-    chart_spec = None
-    if ENABLE_BEDROCK_CHARTS:
-        context = build_chart_context(df)
-        chart_spec = infer_chart_spec(context, question, answer_text, genie_spec)
-    elif genie_spec:
-        chart_spec = genie_spec
-
-    if chart_spec:
-        chart_type = (chart_spec.get("chart_type") or "").lower()
-        cat_col = chart_spec.get("category_col")
-        val_col = chart_spec.get("value_col")
-        agg = (chart_spec.get("aggregation") or "count").lower()
-        title = chart_spec.get("title") or "Chart"
-
-        if cat_col in df.columns:
-            if val_col in df.columns and pd.api.types.is_numeric_dtype(df[val_col]):
-                if agg == "mean":
-                    chart_df = df.groupby(cat_col, dropna=False)[val_col].mean().reset_index()
-                elif agg == "sum":
-                    chart_df = df.groupby(cat_col, dropna=False)[val_col].sum().reset_index()
-                else:
-                    chart_df = df.groupby(cat_col, dropna=False)[val_col].count().reset_index()
-                value_col = val_col
-            else:
-                chart_df = df.groupby(cat_col, dropna=False).size().reset_index(name="count")
-                value_col = "count"
-
-            chart_df = _limit_categories(chart_df, cat_col, value_col, top_n=10)
-            return {
-                "chart_type": chart_type if chart_type in ("pie", "bar", "line") else "bar",
-                "x": cat_col,
-                "y": value_col,
-                "title": title,
-                "data": chart_df.to_dict(orient="records"),
+        # Prepare checkpoint data
+        checkpoint_data = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "messages": [
+                {"role": "user", "content": user_message},
+                {"role": "assistant", "content": ai_response}
+            ],
+            "metadata": metadata or {}
+        }
+        
+        # Create config with thread_id
+        config = {
+            "configurable": {
+                "thread_id": thread_id,
+                "checkpoint_ns": "genie_conversation"
             }
+        }
+        
+        # Save to checkpointer
+        checkpointer.put(
+            config=config,
+            checkpoint=checkpoint_data,
+            metadata={"step": len(get_conversation_history(checkpointer, thread_id)) + 1}
+        )
+        
+        logging.info(f"Saved conversation turn to memory for thread: {thread_id}")
+        
+    except Exception as e:
+        logging.error(f"Error saving conversation turn: {e}")
 
-    # Fallback heuristic
-    if len(numeric_cols) >= 1 and len(non_numeric_cols) >= 1:
-        cat = non_numeric_cols[0]
-        num = numeric_cols[0]
-        chart_df = df[[cat, num]].copy()
-        chart_df = chart_df.groupby(cat, dropna=False)[num].sum().reset_index()
-        chart_df = _limit_categories(chart_df, cat, num, top_n=10)
-        return {
-            "chart_type": "bar",
-            "x": cat,
-            "y": num,
-            "title": f"{num} by {cat}",
-            "data": chart_df.to_dict(orient="records"),
+
+def get_conversation_history(
+    checkpointer,
+    thread_id: str,
+    limit: Optional[int] = None
+) -> List[Dict[str, Any]]:
+    """
+    Retrieve conversation history from LangGraph memory.
+    
+    Args:
+        checkpointer: The memory saver instance
+        thread_id: Thread identifier
+        limit: Optional limit on number of messages to retrieve
+        
+    Returns:
+        List of conversation turns
+    """
+    try:
+        config = {
+            "configurable": {
+                "thread_id": thread_id,
+                "checkpoint_ns": "genie_conversation"
+            }
         }
-    if len(non_numeric_cols) >= 1:
-        cat = non_numeric_cols[0]
-        chart_df = df[[cat]].copy()
-        chart_df = chart_df.value_counts(dropna=False).reset_index(name="count")
-        chart_df = _limit_categories(chart_df, cat, "count", top_n=10)
-        return {
-            "chart_type": "pie",
-            "x": cat,
-            "y": "count",
-            "title": f"{cat} distribution",
-            "data": chart_df.to_dict(orient="records"),
+        
+        # Get all checkpoints for this thread
+        history = []
+        for checkpoint_tuple in checkpointer.list(config):
+            checkpoint = checkpoint_tuple.checkpoint
+            if isinstance(checkpoint, dict) and "messages" in checkpoint:
+                history.append(checkpoint)
+        
+        # Sort by timestamp
+        history.sort(key=lambda x: x.get("timestamp", ""))
+        
+        # Apply limit if specified
+        if limit and len(history) > limit:
+            history = history[-limit:]
+        
+        logging.info(f"Retrieved {len(history)} conversation turns for thread: {thread_id}")
+        return history
+        
+    except Exception as e:
+        logging.error(f"Error retrieving conversation history: {e}")
+        return []
+
+
+def get_all_thread_ids(checkpointer) -> List[str]:
+    """
+    Get all unique thread IDs from the memory store.
+    
+    Args:
+        checkpointer: The memory saver instance
+        
+    Returns:
+        List of thread IDs
+    """
+    try:
+        thread_ids = set()
+        
+        # Iterate through all checkpoints
+        for checkpoint_tuple in checkpointer.list({}):
+            config = checkpoint_tuple.config
+            if isinstance(config, dict):
+                configurable = config.get("configurable", {})
+                thread_id = configurable.get("thread_id")
+                if thread_id:
+                    thread_ids.add(thread_id)
+        
+        return sorted(list(thread_ids))
+        
+    except Exception as e:
+        logging.error(f"Error retrieving thread IDs: {e}")
+        return []
+
+
+def clear_thread_history(checkpointer, thread_id: str):
+    """
+    Clear conversation history for a specific thread.
+    
+    Args:
+        checkpointer: The memory saver instance
+        thread_id: Thread identifier to clear
+    """
+    try:
+        config = {
+            "configurable": {
+                "thread_id": thread_id,
+                "checkpoint_ns": "genie_conversation"
+            }
         }
-    if len(numeric_cols) >= 1:
-        chart_df = df[numeric_cols].copy()
-        return {
-            "chart_type": "line",
-            "x": None,
-            "y": None,
-            "title": "Trend",
-            "data": chart_df.to_dict(orient="records"),
-            "series": numeric_cols,
-        }
-    return None
+        
+        # Note: LangGraph checkpointers don't have a direct delete method
+        # We'll need to implement this based on the specific checkpointer type
+        logging.info(f"Cleared history for thread: {thread_id}")
+        
+    except Exception as e:
+        logging.error(f"Error clearing thread history: {e}")
+
 
 # -----------------------
 # Logging Setup
@@ -346,7 +332,11 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-logging.info("🚀 Genie Streamlit app started (FORCED SQL MODE)")
+logging.info("Genie Streamlit app started")
+
+# Initialize memory saver
+checkpointer = get_memory_saver()
+logging.info(f"Memory saver initialized: {type(checkpointer).__name__}")
 
 # -----------------------
 # Session State
@@ -357,6 +347,10 @@ if "result_cache" not in st.session_state:
     st.session_state.result_cache = {}
 if "question_cache" not in st.session_state:
     st.session_state.question_cache = {}
+if "thread_id" not in st.session_state:
+    # Generate a unique thread ID for this session
+    st.session_state.thread_id = str(uuid.uuid4())
+    logging.info(f"New session started with thread_id: {st.session_state.thread_id}")
 
 # -----------------------
 # Genie API
@@ -388,7 +382,9 @@ def get_query_result(conversation_id, message_id, attachment_id):
         message_id=message_id,
         attachment_id=attachment_id,
     )
+    logging.debug("Raw query result received for attachment_id=%s", attachment_id)
     return result.as_dict() if hasattr(result, "as_dict") else result
+  
 
 def get_query_result_with_retry(conversation_id, message_id, attachment_id, max_attempts: int = 6, base_delay: float = 0.7):
     last_result = None
@@ -415,18 +411,16 @@ def start_conversation_cached(question: str, space_id: str):
     # Cache by question + space to avoid repeated Genie calls
     return start_conversation(question)
 
-@st.cache_data(show_spinner=False)
-def get_query_result_cached(conversation_id, message_id, attachment_id):
-    return get_query_result(conversation_id, message_id, attachment_id)
-
 # -----------------------
 # Streamlit UI
 # -----------------------
 
 st.set_page_config(page_title="Genie AI Analytics", layout="wide")
 
-st.title("🧠 Databricks Genie AI")
-st.caption("🔒 SQL Only • Table Output Only")
+st.title("Databricks Genie AI")
+st.caption("SQL output with optional tables")
+
+# Sidebar for memory management
 
 # Chat container
 chat_container = st.container()
@@ -437,47 +431,112 @@ question = st.chat_input("Ask a question (table answers only)...")
 if question:
     with st.spinner("Genie generating SQL and executing query..."):
         try:
-            normalized_question = question.strip().lower()
-            cached_msg = st.session_state.question_cache.get(normalized_question)
-            if cached_msg:
-                msg = cached_msg
-                cache_hit = True
-            else:
-                msg = start_conversation_cached(question, GENIE_SPACE_ID)
-                st.session_state.question_cache[normalized_question] = msg
-                cache_hit = False
-
-            status = msg.get("status")
-
-            if status == "FAILED":
-                logging.error("Genie FAILED")
-                st.error("Genie failed to process the request")
-            else:
-                attachments = msg.get("attachments") or []
-                answer = msg.get("content", "")
-
-                for att in attachments:
-                    text = (att.get("text") or {}).get("content")
-                    if text:
-                        answer = text
-                        break
-
-                logging.info(f"Attachments: {attachments}")
-
+            local_history_answer = maybe_answer_from_history(question, st.session_state.history)
+            if local_history_answer:
                 st.session_state.history.append({
                     "question": question,
-                    "answer": answer,
-                    "attachments": attachments,
-                    "conversation_id": msg.get("conversation_id"),
-                    "message_id": msg.get("message_id"),
-                    "cache_hit": cache_hit,
+                    "answer": local_history_answer,
+                    "attachments": [],
+                    "conversation_id": None,
+                    "message_id": None,
+                    "cache_hit": True,
                     "refreshed": False,
-                    "viz_spec": extract_genie_viz_spec(attachments, answer)
                 })
+
+                save_conversation_turn(
+                    checkpointer=checkpointer,
+                    thread_id=st.session_state.thread_id,
+                    user_message=question,
+                    ai_response=local_history_answer,
+                    metadata={
+                        "status": "local_history_answer",
+                        "timestamp": datetime.datetime.now().isoformat()
+                    }
+                )
+                logging.info("Answered from local session history without calling Genie")
+            else:
+                normalized_question = question.strip().lower()
+                cached_msg = st.session_state.question_cache.get(normalized_question)
+                if cached_msg:
+                    msg = cached_msg
+                    cache_hit = True
+                else:
+                    msg = start_conversation_cached(question, GENIE_SPACE_ID)
+                    st.session_state.question_cache[normalized_question] = msg
+                    cache_hit = False
+
+                status = msg.get("status")
+
+                if status == "FAILED":
+                    logging.error("Genie FAILED")
+                    st.error("Genie failed to process the request")
+                    
+                    # Save failed interaction to memory
+                    save_conversation_turn(
+                        checkpointer=checkpointer,
+                        thread_id=st.session_state.thread_id,
+                        user_message=question,
+                        ai_response="[ERROR] Genie failed to process the request",
+                        metadata={
+                            "status": "failed",
+                            "timestamp": datetime.datetime.now().isoformat()
+                        }
+                    )
+                else:
+                    attachments = msg.get("attachments") or []
+                    answer = msg.get("content", "")
+
+                    for att in attachments:
+                        text = (att.get("text") or {}).get("content")
+                        if text:
+                            answer = text
+                            break
+
+                    logging.info(f"Attachments: {attachments}")
+
+                    # Save to session state (existing behavior)
+                    st.session_state.history.append({
+                        "question": question,
+                        "answer": answer,
+                        "attachments": attachments,
+                        "conversation_id": msg.get("conversation_id"),
+                        "message_id": msg.get("message_id"),
+                        "cache_hit": cache_hit,
+                        "refreshed": False,
+                    })
+
+                    # Save to LangGraph memory
+                    save_conversation_turn(
+                        checkpointer=checkpointer,
+                        thread_id=st.session_state.thread_id,
+                        user_message=question,
+                        ai_response=answer,
+                        metadata={
+                            "conversation_id": msg.get("conversation_id"),
+                            "message_id": msg.get("message_id"),
+                            "cache_hit": cache_hit,
+                            "attachment_count": len(attachments),
+                            "timestamp": datetime.datetime.now().isoformat()
+                        }
+                    )
+                    
+                    logging.info(f"Conversation saved to LangGraph memory (thread: {st.session_state.thread_id})")
 
         except Exception as e:
             logging.error(str(e))
             st.error(f"Error: {str(e)}")
+            
+            # Save error to memory
+            save_conversation_turn(
+                checkpointer=checkpointer,
+                thread_id=st.session_state.thread_id,
+                user_message=question,
+                ai_response=f"[ERROR] {str(e)}",
+                metadata={
+                    "status": "error",
+                    "timestamp": datetime.datetime.now().isoformat()
+                }
+            )
 
 # -----------------------
 # Display Chat + Tables
@@ -486,10 +545,10 @@ if question:
 with chat_container:
     for item in st.session_state.history:
 
-        st.markdown("### 🧑 You")
+        st.markdown("### You")
         st.write(item["question"])
 
-        st.markdown("### 🤖 Genie (SQL Engine)")
+        st.markdown("### Genie (SQL Engine)")
         st.write(item["answer"])
 
         attachments = item.get("attachments", [])
@@ -501,19 +560,13 @@ with chat_container:
                 attachment_id = att["attachment_id"]
                 cache_key = f"{item['conversation_id']}:{item['message_id']}:{attachment_id}"
                 cached = st.session_state.result_cache.get(cache_key)
-                want_chart = is_chart_request(item.get("question", ""))
                 want_table = DISPLAY_TABLE or is_table_request(item.get("question", ""))
-                want_summary = is_summary_request(item.get("question", ""))
-                genie_viz_spec = item.get("viz_spec")
 
                 try:
                     if cached:
                         df = cached.get("df")
                         csv = cached.get("csv")
-                        summary_text = cached.get("summary_text")
-                        row_count = cached.get("row_count", 0)
-                        col_count = cached.get("col_count", 0)
-                        chart_payload = cached.get("chart_payload")
+                        sql_text = cached.get("sql_text")
                     else:
                         result = get_query_result_with_retry(
                             item["conversation_id"],
@@ -525,14 +578,11 @@ with chat_container:
                         manifest = statement.get("manifest") or {}
                         schema = (manifest.get("schema") or {}).get("columns", [])
                         rows = (statement.get("result") or {}).get("data_array", [])
-
-                        row_count = len(rows) if rows else 0
-                        col_count = len(schema) if schema else 0
-                        summary_text = summarize_result(schema, rows)
+                        sql_text = _extract_sql_text(result)
 
                         df = None
                         csv = None
-                        if want_table or ENABLE_CSV_DOWNLOAD or want_chart:
+                        if want_table or ENABLE_CSV_DOWNLOAD:
                             if schema and rows:
                                 columns = [col["name"] for col in schema]
                                 df = pd.DataFrame(rows, columns=columns)
@@ -542,63 +592,22 @@ with chat_container:
                         st.session_state.result_cache[cache_key] = {
                             "df": df,
                             "csv": csv,
-                            "summary_text": summary_text,
-                            "row_count": row_count,
-                            "col_count": col_count,
-                            "chart_payload": None,
+                            "sql_text": sql_text,
                         }
 
-                    if summary_text is not None:
+                    if sql_text or (want_table and df is not None) or (ENABLE_CSV_DOWNLOAD and csv is not None):
+                        if sql_text:
+                            st.markdown("### SQL Query")
+                            st.code(sql_text, language="sql")
                         if want_table and df is not None:
-                            st.markdown("### 📊 Query Result")
+                            st.markdown("### Query Result")
                             st.dataframe(df, use_container_width=True)
 
-                        if want_chart and df is not None and not df.empty:
-                            st.markdown("### 📈 Chart")
-                            if chart_payload is None:
-                                chart_payload = build_chart_payload(
-                                    df,
-                                    item.get("question", ""),
-                                    item.get("answer", ""),
-                                    genie_viz_spec
-                                )
-                                if chart_payload is not None:
-                                    st.session_state.result_cache[cache_key]["chart_payload"] = chart_payload
-
-                            if chart_payload:
-                                chart_df = pd.DataFrame(chart_payload.get("data") or [])
-                                chart_type = chart_payload.get("chart_type")
-                                title = chart_payload.get("title") or "Chart"
-                                x = chart_payload.get("x")
-                                y = chart_payload.get("y")
-                                series = chart_payload.get("series") or []
-
-                                if chart_type == "pie" and x in chart_df.columns and y in chart_df.columns:
-                                    fig = px.pie(chart_df, names=x, values=y, title=title)
-                                    st.plotly_chart(fig, use_container_width=True)
-                                elif chart_type == "line" and series:
-                                    fig = px.line(pd.DataFrame(chart_payload.get("data") or []), y=series, title=title)
-                                    st.plotly_chart(fig, use_container_width=True)
-                                elif x in chart_df.columns and y in chart_df.columns:
-                                    if chart_type == "line":
-                                        fig = px.line(chart_df, x=x, y=y, title=title)
-                                    else:
-                                        fig = px.bar(chart_df, x=x, y=y, title=title)
-                                    st.plotly_chart(fig, use_container_width=True)
-                                else:
-                                    st.write("No chartable columns returned.")
-                            else:
-                                st.write("No chartable columns returned.")
-
-                        if want_summary and not want_table:
-                            if SHOW_SUMMARY_HEADER:
-                                st.markdown("### ✅ Result Summary")
-                            st.write(summary_text)
 
                         # CSV Export
                         if ENABLE_CSV_DOWNLOAD and csv is not None:
                             st.download_button(
-                                "⬇ Download CSV",
+                                "Download CSV",
                                 csv,
                                 file_name="query_result.csv",
                                 mime="text/csv",
