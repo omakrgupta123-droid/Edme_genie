@@ -1,6 +1,8 @@
 mcp
 databricks-sdk>=0.12.0
 httpx>=0.24.0
+langgraph
+
 python-dotenv>=1.0.0 
 databricks-sdk[openai]
 plotly>=5.0.0
